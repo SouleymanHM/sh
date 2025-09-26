@@ -65,3 +65,122 @@ def gaussian_blur(img: np.ndarray, sigma: float = 3.0) -> np.ndarray:
     blurred_image = gaussian_filter(image, sigma=sigma)
     return blurred_image
 
+
+def image_spread(img: np.ndarray, centroid_x: float, centroid_y: float) -> float:
+    """
+    Calculate the intensity-weighted spread (RMS radius) of a 2D grayscale image,
+    relative to a given centroid (centroid_x, centroid_y).
+
+    Spread = sqrt( sum(I * d^2) / sum(I) )
+    where d^2 is squared distance from (centroid_x, centroid_y).
+    """
+    # Ensure float for math
+    img = img.astype(np.float64)
+
+    # Build coordinate grids
+    y, x = np.indices(img.shape)
+
+    # Squared distances from provided centroid
+    d2 = (x - centroid_x) ** 2 + (y - centroid_y) ** 2
+
+    # Intensity-weighted mean squared distance
+    total_intensity = img.sum()
+    if total_intensity <= 0:
+        return 0.0
+
+    spread = np.sqrt((img * d2).sum() / total_intensity)
+    return spread
+
+
+def quad_center(img: np.ndarray, max_iterations = 5):
+    img = img.astype(np.float64, copy=False)
+    blurred_img = gaussian_blur(img, 2)
+    centroid_x, centroid_y = centroid(blurred_img)
+    img = shift_image_to_center(img,centroid_x,centroid_y)
+
+    image_height, image_width = img.shape
+    #frame_center_y = image_height // 2   # row index of horizontal split
+    #frame_center_x = image_width // 2    # column index of vertical split
+
+    centroid_x = int(round(centroid_x))
+    centroid_y = int(round(centroid_y))
+    
+    top_half    = img[0:centroid_y, :]               # rows 0 .. frame_center_y-1, all columns
+    bottom_half = img[centroid_y:image_height, :]    # rows frame_center_y .. end, all columns
+    left_half   = img[:, 0:centroid_x]               # all rows, cols 0 .. frame_center_x-1
+    right_half  = img[:, centroid_x:image_width]     # all rows, cols frame_center_x .. end
+    
+    image_intensity = float(img.sum())
+    top_half_intensity = float(top_half.sum())
+    bottom_half_intensity = float(bottom_half.sum())
+    left_half_intensity = float(left_half.sum())
+    right_half_intensity = float(right_half.sum())
+    
+    if not np.isfinite(image_intensity) or image_intensity <= 0.0:
+        # Nothing to do; keep current image
+        return img
+
+    spread = image_spread(img, centroid_x, centroid_y)
+    spread = float(spread)
+
+    gain = 1.5 * spread
+
+    horizontal_shift = gain * (left_half_intensity - right_half_intensity) / image_intensity
+    vertical_shift = gain * (bottom_half_intensity - top_half_intensity) / image_intensity
+
+    cap = 0.5 * min(image_width, image_height)
+    horizontal_shift = float(np.clip(horizontal_shift, -cap, cap))
+    vertical_shift   = float(np.clip(vertical_shift,   -cap, cap))
+    
+    shift_image_to_center(img, (centroid_x + horizontal_shift), (centroid_y + vertical_shift))
+
+    print(max_iterations, (horizontal_shift, vertical_shift), (np.sqrt(horizontal_shift ** 2 + vertical_shift ** 2)/spread))
+
+    max_iterations -= 1
+    
+    if max_iterations <= 0 or (np.sqrt(horizontal_shift ** 2 + vertical_shift ** 2)/spread) <= 0.05:
+        print()
+        transformation_matrix = np.array([[1, 0, horizontal_shift], [0, 1, vertical_shift]], dtype=np.float32)
+        img = cv2.warpAffine(
+            img,
+            transformation_matrix,
+            (image_width, image_height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0
+        )
+       
+        img = overlay_frame_center_red(img, centroid_x, centroid_y)
+        return img
+    
+    else:
+        shift_image_to_center(img, (centroid_x + horizontal_shift), (centroid_y + vertical_shift))
+        return quad_center(img, max_iterations)
+
+
+
+folder_in = "tiff_folder"
+folder_out = "out"
+os.makedirs(folder_out, exist_ok=True)  # make sure "out/" exists
+
+for file in os.listdir(folder_in):
+    if not (file.lower().endswith(".tif") or file.lower().endswith(".tiff")):
+        continue  # skip non-TIFF files
+
+    # Full path to input file
+    file_path = os.path.join(folder_in, file)
+
+    # Load image
+    image = tiff.imread(file_path)
+
+    # Process image
+        
+    image = quad_center(image,5)
+
+    # Build output filename (strip extension, add suffix, save to out/)
+    base, ext = os.path.splitext(file)
+    filename = f"{base}_quad_center{ext}"
+    out_path = os.path.join(folder_out, filename)
+
+   # Save result
+    save_tiff_uint8(image, out_path)
