@@ -27,6 +27,119 @@ def save_tiff_uint8(array: np.ndarray, path: str):
         array_uint8 = np.zeros_like(array, dtype=np.uint8)
     tiff.imwrite(str(path), array_uint8, compression="deflate")
 
+
+
+def denoise_with_blank(
+    img: np.ndarray,
+    blank: np.ndarray,
+    mode: str = "global",       # "global" (one a,b) or "tiled" (per-block a,b)
+    tile_size: int = 128,       # used when mode="tiled"
+    clip: bool = True,          # clip result to original dtype range
+    trim_quantile: float = 0.01 # robustify regression by trimming extremes (1% tails)
+):
+    """
+    Remove fixed-pattern noise using a blank/noise reference frame.
+
+    The model is:  clean = img - (a * blank + b)
+    where (a, b) are estimated to best match the noise level (robustly).
+
+    Args:
+        img:   2D (or 3D single-channel) image (any numeric dtype).
+        blank: Same shape as img; a blank/noise frame (e.g., dark frame).
+        mode:  "global" uses a single affine (a,b). "tiled" estimates (a,b) per tile.
+        tile_size: Size of square tiles for "tiled" mode.
+        clip:  If True, clip output to the valid range of img's dtype.
+        trim_quantile: Fraction of low/high tails trimmed from regression (robustness).
+
+    Returns:
+        denoised: float32 array by default (or clipped to original dtype range if clip=True).
+        meta: dict with keys:
+              - 'mode': "global" or "tiled"
+              - 'a', 'b' for global mode
+              - 'a_map', 'b_map' for tiled mode (float32 maps at tile resolution)
+              - 'trim_quantile'
+    """
+    if img.shape != blank.shape:
+        raise ValueError("img and blank must have the same shape")
+
+    # Work in float32 to avoid precision/overflow issues.
+    img_f   = np.asarray(img,   dtype=np.float32)
+    blank_f = np.asarray(blank, dtype=np.float32)
+
+    # Helper: robust affine fit y ≈ a*x + b using trimmed least squares
+    def robust_affine_fit(y, x, q=trim_quantile):
+        yv = y.reshape(-1)
+        xv = x.reshape(-1)
+
+        # Remove NaNs/Infs
+        mask = np.isfinite(yv) & np.isfinite(xv)
+        yv, xv = yv[mask], xv[mask]
+        if yv.size < 10:
+            return 1.0, 0.0  # fallback
+
+        # Trim extremes (winsorization by masking)
+        lo_y, hi_y = np.quantile(yv, [q, 1 - q])
+        lo_x, hi_x = np.quantile(xv, [q, 1 - q])
+        m2 = (yv >= lo_y) & (yv <= hi_y) & (xv >= lo_x) & (xv <= hi_x)
+        yv, xv = yv[m2], xv[m2]
+        if yv.size < 10:
+            return 1.0, 0.0
+
+        # Closed-form LS for a,b
+        x_mean = float(xv.mean())
+        y_mean = float(yv.mean())
+        x_var  = float(((xv - x_mean) ** 2).mean())
+        if x_var <= 1e-12:
+            return 1.0, y_mean  # degenerate: blank nearly constant
+
+        cov_xy = float(((xv - x_mean) * (yv - y_mean)).mean())
+        a = cov_xy / x_var
+        b = y_mean - a * x_mean
+        return a, b
+
+    meta = {"mode": mode, "trim_quantile": float(trim_quantile)}
+
+    if mode == "global":
+        a, b = robust_affine_fit(img_f, blank_f)
+        denoised_f = img_f - (a * blank_f + b)
+        meta.update({"a": float(a), "b": float(b)})
+
+    elif mode == "tiled":
+        H, W = img_f.shape[:2]
+        a_map = np.zeros(( (H + tile_size - 1)//tile_size,
+                           (W + tile_size - 1)//tile_size), dtype=np.float32)
+        b_map = np.zeros_like(a_map)
+
+        denoised_f = np.empty_like(img_f)
+        for ti, y0 in enumerate(range(0, H, tile_size)):
+            for tj, x0 in enumerate(range(0, W, tile_size)):
+                y1 = min(y0 + tile_size, H)
+                x1 = min(x0 + tile_size, W)
+                patch_img   = img_f[y0:y1, x0:x1]
+                patch_blank = blank_f[y0:y1, x0:x1]
+
+                a, b = robust_affine_fit(patch_img, patch_blank)
+                a_map[ti, tj] = a
+                b_map[ti, tj] = b
+
+                denoised_f[y0:y1, x0:x1] = patch_img - (a * patch_blank + b)
+
+        meta.update({"a_map": a_map, "b_map": b_map})
+    else:
+        raise ValueError('mode must be "global" or "tiled"')
+
+    # Optional clipping to input dtype range
+    if clip:
+        # Determine valid range from original dtype (assume integer if int type, else no clip)
+        if np.issubdtype(img.dtype, np.integer):
+            info = np.iinfo(img.dtype)
+            denoised_f = np.clip(denoised_f, info.min, info.max)
+        # For floats, typically you don't clip; keep as-is
+
+    return denoised_f.astype(np.float32, copy=False), meta
+
+
+
 def save_tiff(array: np.ndarray, path: str):
     tiff.imwrite(str(path), array)
 
@@ -449,7 +562,10 @@ def sigma_clip_spots(spots, sigma=2.0, max_iter=2):
             break
 
     return [tuple(pt) for pt in pts[keep_mask]]
-import numpy as np
+
+
+
+
 
 def sigma_clip_spots_mad_2(spots,
                          sigma=2.5,
