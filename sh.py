@@ -12,7 +12,7 @@ from typing import List, Tuple, Optional, Dict
 from astropy.stats import mad_std
 
 LENSLET_PITCH = 30    # in pixels
-PIXEL_PITCH = 5       # in um
+PIXEL_PITCH = 5.86    # in um
 PUPIL_DIAMETER = 3    # in mm
 
 def save_tiff_uint8(array: np.ndarray, path: str):
@@ -479,6 +479,112 @@ def find_spots(img: np.ndarray, max_spots=1000, quality=0.01, min_dist=20):
         return []
     return [(float(x), float(y)) for [[x, y]] in pts]
 
+
+def spots_to_ij_dxdy(
+    all_spots,              # list of arrays-like [(x,y), ...] for each frame
+    centers,                # list of (cx, cy) for each frame (same length as all_spots)
+    ref_index=0,            # which frame is the reference
+    lenslet_pitch_px=None,  # if None, robustly estimated from the reference frame
+    k_neighbors=5           # for pitch estimation (median of k-NN)
+):
+    """
+    Align multiple spot sets to a reference center and produce per-frame N×4 arrays [i, j, dx, dy].
+
+    - The reference frame is all_spots[ref_index] with center centers[ref_index].
+    - Each other frame is shifted so its (cx, cy) coincides with the reference center.
+    - Lenslet indices (i, j) are assigned by rounding ((x - cx_ref)/pitch, (y - cy_ref)/pitch).
+    - For each frame, dx, dy are computed relative to the *reference* spot at the same (i, j).
+      (Reference frame returns dx=dy=0 for matched spots.)
+    - Frames may have missing or extra spots; only matched (i, j) pairs are emitted.
+
+    Returns:
+        per_frame_ij_dxdy: list of arrays, one per frame, shape (N_k, 4) with columns [i, j, dx, dy].
+                           i, j are ints; dx, dy are floats.
+        meta: dict with keys:
+              - 'pitch_px': the pitch used (float)
+              - 'ref_center': (cx, cy) used
+              - 'ref_index': index of reference frame
+    """
+    if len(all_spots) == 0 or len(all_spots) != len(centers):
+        raise ValueError("Provide non-empty all_spots and matching centers")
+
+    # Convert to float arrays
+    spot_sets = [np.asarray(s, dtype=np.float64).reshape(-1, 2) for s in all_spots]
+    centers  = [tuple(map(float, c)) for c in centers]
+
+    # Reference data
+    ref_spots  = spot_sets[ref_index]
+    cx_ref, cy_ref = centers[ref_index]
+
+    # Shift reference to its own center = (0,0) for convenience
+    ref_shifted = ref_spots - np.array([cx_ref, cy_ref], dtype=np.float64)
+
+    # --- Estimate lenslet pitch if not provided (robust median of k-NN distances) ---
+    if lenslet_pitch_px is None:
+        if len(ref_shifted) < k_neighbors + 1:
+            raise ValueError("Not enough reference spots to estimate pitch; pass lenslet_pitch_px explicitly.")
+        tree = cKDTree(ref_shifted)
+        # distances to k nearest neighbors (excluding self)
+        dists, _ = tree.query(ref_shifted, k=min(k_neighbors + 1, len(ref_shifted)))
+        # drop the self-distance at column 0
+        nn = dists[:, 1:]
+        # feature per point: median of its k-NN distances
+        per_pt = np.median(nn, axis=1)
+        # robust global pitch: median of per-point medians
+        pitch_px = float(np.median(per_pt))
+        if not np.isfinite(pitch_px) or pitch_px <= 0:
+            raise ValueError("Failed to estimate a valid lenslet pitch from reference set.")
+    else:
+        pitch_px = float(lenslet_pitch_px)
+
+    # Helper to convert XY (centered at ref center) into integer lenslet indices
+    def xy_to_ij(xy_centered):
+        ij = np.rint(xy_centered / pitch_px).astype(np.int64)  # round to nearest grid index
+        return ij[:, 0], ij[:, 1]  # i = x index, j = y index
+
+    # Build a lookup for the reference frame: (i,j) -> (x,y)
+    ref_ij = np.rint(ref_shifted / pitch_px).astype(np.int64)
+    ref_dict = {}
+    for (ij, xy) in zip(ref_ij, ref_shifted):
+        key = (int(ij[0]), int(ij[1]))
+        # Keep the spot whose position is closest to its rounded grid node (dedup safety)
+        if key in ref_dict:
+            if np.linalg.norm(xy - ij * pitch_px) < np.linalg.norm(ref_dict[key] - ij * pitch_px):
+                ref_dict[key] = xy
+        else:
+            ref_dict[key] = xy
+
+    # For each frame, align centers and compute [i, j, dx, dy] vs reference
+    per_frame = []
+    for k, (spots, (cx, cy)) in enumerate(zip(spot_sets, centers)):
+        # shift so this frame's center coincides with reference center
+        shifted = spots - np.array([cx, cy], dtype=np.float64) + np.array([cx_ref, cy_ref], dtype=np.float64)
+        # then center at reference origin
+        shifted -= np.array([cx_ref, cy_ref], dtype=np.float64)
+
+        # indices
+        i_idx, j_idx = xy_to_ij(shifted)
+
+        rows = []
+        for (i, j), xy in zip(zip(i_idx, j_idx), shifted):
+            key = (int(i), int(j))
+            ref_xy = ref_dict.get(key, None)
+            if ref_xy is None:
+                continue  # no reference spot for this lenslet id; skip
+            dx, dy = (xy - ref_xy)
+            rows.append([i, j, float(dx), float(dy)])
+
+        if rows:
+            per_frame.append(np.asarray(rows, dtype=np.float64))
+        else:
+            per_frame.append(np.empty((0, 4), dtype=np.float64))
+
+    meta = {
+        "pitch_px": pitch_px,
+        "ref_center": (cx_ref, cy_ref),
+        "ref_index": ref_index,
+    }
+    return per_frame, meta
 
 
 def draw_spots_on_image(
