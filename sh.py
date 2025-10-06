@@ -140,8 +140,7 @@ def denoise_with_blank(
 
 
 
-def save_tiff(array: np.ndarray, path: str):
-    tiff.imwrite(str(path), array)
+
 
 def centroid(img: np.ndarray):
     image = img.astype(np.float32)
@@ -480,111 +479,113 @@ def find_spots(img: np.ndarray, max_spots=1000, quality=0.01, min_dist=20):
     return [(float(x), float(y)) for [[x, y]] in pts]
 
 
-def spots_to_ij_dxdy(
-    all_spots,              # list of arrays-like [(x,y), ...] for each frame
-    centers,                # list of (cx, cy) for each frame (same length as all_spots)
-    ref_index=0,            # which frame is the reference
-    lenslet_pitch_px=None,  # if None, robustly estimated from the reference frame
-    k_neighbors=5           # for pitch estimation (median of k-NN)
-):
-    """
-    Align multiple spot sets to a reference center and produce per-frame N×4 arrays [i, j, dx, dy].
 
-    - The reference frame is all_spots[ref_index] with center centers[ref_index].
-    - Each other frame is shifted so its (cx, cy) coincides with the reference center.
-    - Lenslet indices (i, j) are assigned by rounding ((x - cx_ref)/pitch, (y - cy_ref)/pitch).
-    - For each frame, dx, dy are computed relative to the *reference* spot at the same (i, j).
-      (Reference frame returns dx=dy=0 for matched spots.)
-    - Frames may have missing or extra spots; only matched (i, j) pairs are emitted.
+
+
+def remove_spacing_outliers(spots, tol=3.0, min_pts_per_line=4, cluster_tol=10.0):
+    """
+    Remove 'dead-pixel' or misaligned spots based on inconsistent spacing along clustered lines.
+
+    Args:
+        spots: array-like [(x, y), ...] of detected spot coordinates.
+        tol: how many MADs from the median spacing counts as an outlier (default 3).
+        min_pts_per_line: minimum spots required to analyze a line.
+        cluster_tol: tolerance (pixels) for line clustering along x and y (passed to cluster_lines).
 
     Returns:
-        per_frame_ij_dxdy: list of arrays, one per frame, shape (N_k, 4) with columns [i, j, dx, dy].
-                           i, j are ints; dx, dy are floats.
-        meta: dict with keys:
-              - 'pitch_px': the pitch used (float)
-              - 'ref_center': (cx, cy) used
-              - 'ref_index': index of reference frame
+        filtered_spots: list of (x, y) with inconsistent line-spacing outliers removed.
+        outliers: list of (x, y) that were removed.
     """
-    if len(all_spots) == 0 or len(all_spots) != len(centers):
-        raise ValueError("Provide non-empty all_spots and matching centers")
+    from math import isnan
+    from copy import deepcopy
 
-    # Convert to float arrays
-    spot_sets = [np.asarray(s, dtype=np.float64).reshape(-1, 2) for s in all_spots]
-    centers  = [tuple(map(float, c)) for c in centers]
+    def cluster_lines(values: np.ndarray, tol: float = 10.0):
+        values = np.asarray(values, float)
+        order = np.argsort(values)
+        v = values[order]
+        centers = []
+        idx_map = np.full(len(values), -1, dtype=int)
+        if len(v) == 0:
+            return np.array([]), idx_map
+        start = 0
+        lid = 0
+        for i in range(1, len(v)):
+            if abs(v[i] - v[i - 1]) > tol:
+                seg = v[start:i]
+                centers.append(seg.mean())
+                idx_map[order[start:i]] = lid
+                start = i
+                lid += 1
+        seg = v[start:]
+        centers.append(seg.mean())
+        idx_map[order[start:]] = lid
+        centers = np.array(centers, float)
+        sort_order = np.argsort(centers)
+        inv = np.argsort(sort_order)
+        return centers[sort_order], inv[idx_map]
 
-    # Reference data
-    ref_spots  = spot_sets[ref_index]
-    cx_ref, cy_ref = centers[ref_index]
+    spots = np.asarray(spots, dtype=np.float64)
+    if len(spots) < 3:
+        return spots, []
 
-    # Shift reference to its own center = (0,0) for convenience
-    ref_shifted = ref_spots - np.array([cx_ref, cy_ref], dtype=np.float64)
+    # --- cluster into approximate rows and columns ---
+    x, y = spots[:, 0], spots[:, 1]
+    x_centers, col_ids = cluster_lines(x, tol=cluster_tol)
+    y_centers, row_ids = cluster_lines(y, tol=cluster_tol)
 
-    # --- Estimate lenslet pitch if not provided (robust median of k-NN distances) ---
-    if lenslet_pitch_px is None:
-        if len(ref_shifted) < k_neighbors + 1:
-            raise ValueError("Not enough reference spots to estimate pitch; pass lenslet_pitch_px explicitly.")
-        tree = cKDTree(ref_shifted)
-        # distances to k nearest neighbors (excluding self)
-        dists, _ = tree.query(ref_shifted, k=min(k_neighbors + 1, len(ref_shifted)))
-        # drop the self-distance at column 0
-        nn = dists[:, 1:]
-        # feature per point: median of its k-NN distances
-        per_pt = np.median(nn, axis=1)
-        # robust global pitch: median of per-point medians
-        pitch_px = float(np.median(per_pt))
-        if not np.isfinite(pitch_px) or pitch_px <= 0:
-            raise ValueError("Failed to estimate a valid lenslet pitch from reference set.")
-    else:
-        pitch_px = float(lenslet_pitch_px)
+    # function for robust MAD
+    def mad(arr):
+        med = np.median(arr)
+        return 1.4826 * np.median(np.abs(arr - med))
 
-    # Helper to convert XY (centered at ref center) into integer lenslet indices
-    def xy_to_ij(xy_centered):
-        ij = np.rint(xy_centered / pitch_px).astype(np.int64)  # round to nearest grid index
-        return ij[:, 0], ij[:, 1]  # i = x index, j = y index
+    keep_mask = np.ones(len(spots), bool)
+    outliers = []
 
-    # Build a lookup for the reference frame: (i,j) -> (x,y)
-    ref_ij = np.rint(ref_shifted / pitch_px).astype(np.int64)
-    ref_dict = {}
-    for (ij, xy) in zip(ref_ij, ref_shifted):
-        key = (int(ij[0]), int(ij[1]))
-        # Keep the spot whose position is closest to its rounded grid node (dedup safety)
-        if key in ref_dict:
-            if np.linalg.norm(xy - ij * pitch_px) < np.linalg.norm(ref_dict[key] - ij * pitch_px):
-                ref_dict[key] = xy
-        else:
-            ref_dict[key] = xy
+    # --- check rows ---
+    for row in np.unique(row_ids):
+        mask = row_ids == row
+        if mask.sum() < min_pts_per_line:
+            continue
+        line = spots[mask]
+        line = line[np.argsort(line[:, 0])]  # sort along x
+        diffs = np.diff(line[:, 0])
+        med_d = np.median(diffs)
+        mad_d = mad(diffs)
+        if mad_d == 0 or np.isnan(mad_d):
+            continue
+        # an outlier has two large adjacent diffs or one tiny one breaking pattern
+        bad = np.where((diffs < med_d - tol * mad_d) | (diffs > med_d + tol * mad_d))[0]
+        # remove the middle spot if both adjacent diffs are abnormal
+        for b in bad:
+            if 0 < b < len(line) - 1:
+                outlier = line[b]
+                idx = np.where((spots == outlier).all(axis=1))[0]
+                keep_mask[idx] = False
 
-    # For each frame, align centers and compute [i, j, dx, dy] vs reference
-    per_frame = []
-    for k, (spots, (cx, cy)) in enumerate(zip(spot_sets, centers)):
-        # shift so this frame's center coincides with reference center
-        shifted = spots - np.array([cx, cy], dtype=np.float64) + np.array([cx_ref, cy_ref], dtype=np.float64)
-        # then center at reference origin
-        shifted -= np.array([cx_ref, cy_ref], dtype=np.float64)
+    # --- check columns ---
+    for col in np.unique(col_ids):
+        mask = col_ids == col
+        if mask.sum() < min_pts_per_line:
+            continue
+        line = spots[mask]
+        line = line[np.argsort(line[:, 1])]  # sort along y
+        diffs = np.diff(line[:, 1])
+        med_d = np.median(diffs)
+        mad_d = mad(diffs)
+        if mad_d == 0 or np.isnan(mad_d):
+            continue
+        bad = np.where((diffs < med_d - tol * mad_d) | (diffs > med_d + tol * mad_d))[0]
+        for b in bad:
+            if 0 < b < len(line) - 1:
+                outlier = line[b]
+                idx = np.where((spots == outlier).all(axis=1))[0]
+                keep_mask[idx] = False
 
-        # indices
-        i_idx, j_idx = xy_to_ij(shifted)
+    filtered = spots[keep_mask]
+    outliers = spots[~keep_mask]
+    return [filtered.tolist(), outliers.tolist()]
 
-        rows = []
-        for (i, j), xy in zip(zip(i_idx, j_idx), shifted):
-            key = (int(i), int(j))
-            ref_xy = ref_dict.get(key, None)
-            if ref_xy is None:
-                continue  # no reference spot for this lenslet id; skip
-            dx, dy = (xy - ref_xy)
-            rows.append([i, j, float(dx), float(dy)])
 
-        if rows:
-            per_frame.append(np.asarray(rows, dtype=np.float64))
-        else:
-            per_frame.append(np.empty((0, 4), dtype=np.float64))
-
-    meta = {
-        "pitch_px": pitch_px,
-        "ref_center": (cx_ref, cy_ref),
-        "ref_index": ref_index,
-    }
-    return per_frame, meta
 
 
 def draw_spots_on_image(
@@ -673,7 +674,7 @@ def sigma_clip_spots(spots, sigma=2.0, max_iter=2):
 
 
 
-def sigma_clip_spots_mad_2(spots,
+def sigma_clip_spots_mad(spots,
                          sigma=2.5,
                          max_iter=5,
                          k_neighbors=5,         # (2) use median of k-NN distances
@@ -759,56 +760,7 @@ def sigma_clip_spots_mad_2(spots,
 
 
 
-def sigma_clip_spots_mad(spots, sigma=2.5, max_iter=5):
-    """
-    Iterative MAD-based sigma clipping on spots based on nearest neighbor distances.
-    Keeps only spots whose distances to neighbors are within a tolerance.
-    """
-    if not spots:
-        return []
 
-    pts = np.array(spots, dtype=np.float64)
-    keep_mask = np.ones(len(pts), dtype=bool)
-
-    for it in range(max_iter):
-        pts_kept = pts[keep_mask]
-        if len(pts_kept) < 5:
-            break
-
-        # pairwise distances
-        dists = np.linalg.norm(
-            pts_kept[None, :, :] - pts_kept[:, None, :],
-            axis=-1
-        )
-        np.fill_diagonal(dists, np.inf)
-
-        # get 4 nearest neighbors for each point
-        nearest = np.sort(dists, axis=1)[:, :4]
-        d_min = nearest.min(axis=1)
-        d_max = nearest.max(axis=1)
-
-        # robust stats using median and MAD
-        med_min = np.median(d_min)
-        mad_min = mad_std(d_min)
-
-        med_max = np.median(d_max)
-        mad_max = mad_std(d_max)
-
-        # clipping mask
-        mask = (
-            (d_min > med_min - sigma * mad_min) & (d_min < med_min + sigma * mad_min) &
-            (d_max > med_max - sigma * mad_max) & (d_max < med_max + sigma * mad_max)
-        )
-
-        keep_mask[keep_mask] = mask
-
-        #print(f"Iter {it+1}: kept {mask.sum()}/{len(mask)} spots | "
-        #      f"median min dist={med_min:.2f}, median max dist={med_max:.2f}")
-
-        if mask.all():
-            break
-
-    return [tuple(pt) for pt in pts[keep_mask]]
 
 
 def cluster_lines(values: np.ndarray, tol: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
@@ -903,177 +855,7 @@ def true_centroid(
     return results
 
 
-#*************************************
-def fit_zernike_4_6_from_displacements(obs: np.ndarray, ref: np.ndarray):
-    """
-    Least-squares fit of Z4–Z6 from displacement vectors.
-    obs: Nx2 captured points (normalized)
-    ref: Nx2 reference points (normalized)
-    """
-    if obs.shape != ref.shape or obs.shape[1] != 2:
-        raise ValueError("obs and ref must be Nx2 arrays")
 
-    dxdy = obs - ref
-    dx, dy = dxdy[:, 0], dxdy[:, 1]
-    x,  y  = ref[:, 0],  ref[:, 1]
-
-    # Correct gradients for Z4–Z6 (unit pupil)
-    Ax = np.stack([2.0*x, 2.0*y, 2.0*x], axis=1)   # d/dx for Z4, Z5, Z6
-    Ay = np.stack([2.0*y, 2.0*x, -2.0*y], axis=1)  # d/dy for Z4, Z5, Z6
-
-    A = np.vstack([Ax, Ay])
-    b = np.hstack([dx, dy])
-
-    coeffs, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    z4, z5, z6 = coeffs.tolist()
-    return z4, z5, z6
-
-#*************************************
-
-
-def zernike_from_nearest_with_centroids_1(
-    reference_spots: List[Tuple[float, float]],
-    captured_spots:  List[Tuple[float, float]],
-    ref_centroid:    Tuple[float, float],
-    cap_centroid:    Tuple[float, float],
-    max_dist: float = np.inf,
-    min_matches: int = 12,
-    return_pairs: bool = False
-):
-    """
-    Overlay by your provided centroids (translation only), then:
-      - For each reference spot, find nearest captured spot.
-      - Drop pairs with distance > max_dist (no interpolation).
-      - Fit Z4–Z6 from surviving pairs.
-
-    Args:
-        reference_spots: [(x,y)] for the reference grid (any length >= 2)
-        captured_spots:  [(x,y)] for the captured frame (any length >= 2)
-        ref_centroid:    (cx_ref, cy_ref) centroid of reference_spots (you provide)
-        cap_centroid:    (cx_cap, cy_cap) centroid of captured_spots (you provide)
-        max_dist:        distance gate in pixels (≈ 1/3–1/2 of lenslet pitch is typical)
-        min_matches:     minimum matched pairs required to attempt fit
-        return_pairs:    if True, also return the matched arrays (ref_m, obs_m)
-
-    Returns:
-        (z4, z5, z6)  or  ((z4, z5, z6), ref_m, obs_m) if return_pairs=True
-
-    Raises:
-        RuntimeError if not enough pairs survive the distance gate.
-    """
-    ref = np.asarray(reference_spots, dtype=np.float64)
-    obs = np.asarray(captured_spots,  dtype=np.float64)
-    if ref.ndim != 2 or ref.shape[1] != 2 or obs.ndim != 2 or obs.shape[1] != 2:
-        raise ValueError("Inputs must be arrays/lists of (x,y) points.")
-    if len(ref) < 2 or len(obs) < 2:
-        raise RuntimeError("Not enough points to match.")
-
-    # 1) translate captured → reference using provided centroids
-    refc = np.asarray(ref_centroid, dtype=np.float64)
-    capc = np.asarray(cap_centroid, dtype=np.float64)
-    if refc.shape != (2,) or capc.shape != (2,):
-        raise ValueError("ref_centroid and cap_centroid must be length-2 tuples.")
-    shift = refc - capc
-    obs_shifted = obs + shift
-
-    # 2) nearest-neighbor match: reference -> shifted captured
-    tree = cKDTree(obs_shifted)
-    d, idx = tree.query(ref, k=1)
-
-    # 3) distance gate
-    keep = d <= max_dist if np.isfinite(max_dist) else np.ones_like(d, dtype=bool)
-    ref_m = ref[keep]
-    obs_m = obs_shifted[idx[keep]]
-
-    # 4) enough matches?
-    if len(ref_m) < min_matches:
-        raise RuntimeError(f"Insufficient matches after gating: {len(ref_m)} < {min_matches}")
-
-    # 5) fit Z4–Z6 (uses your existing function)
-    z4, z5, z6 = fit_zernike_4_6_from_displacements(obs_m, ref_m)
-
-    if return_pairs:
-        return (float(z4), float(z5), float(z6)), ref_m, obs_m
-    return (float(z4), float(z5), float(z6))
-
-#####################################
-def zernike_from_nearest_with_centroids(
-    reference_spots: List[Tuple[float, float]],
-    captured_spots:  List[Tuple[float, float]],
-    ref_centroid:    Tuple[float, float],
-    cap_centroid:    Tuple[float, float],
-    lenslet_pitch_px: float,
-    pixel_pitch_um:   float,
-    pupil_diameter_mm: float,
-    max_dist: float = np.inf,
-    min_matches: int = 12,
-    return_pairs: bool = False
-):
-    """
-    Overlay by your provided centroids (translation only), then:
-      - For each reference spot, find nearest captured spot.
-      - Drop pairs with distance > max_dist (no interpolation).
-      - Fit Z4–Z6 from surviving pairs using normalized pupil coords.
-
-    Units:
-        - lenslet_pitch_px: lenslet pitch in pixels
-        - pixel_pitch_um: camera pixel pitch in microns
-        - pupil_diameter_mm: pupil diameter in millimeters
-
-    Returns:
-        (z4, z5, z6) or ((z4, z5, z6), ref_m, obs_m)
-    """
-    ref = np.asarray(reference_spots, dtype=np.float64)
-    obs = np.asarray(captured_spots,  dtype=np.float64)
-    if ref.ndim != 2 or ref.shape[1] != 2 or obs.ndim != 2 or obs.shape[1] != 2:
-        raise ValueError("Inputs must be arrays/lists of (x,y) points.")
-    if len(ref) < 2 or len(obs) < 2:
-        raise RuntimeError("Not enough points to match.")
-
-    # 1) translate captured → reference using provided centroids
-    refc = np.asarray(ref_centroid, dtype=np.float64)
-    capc = np.asarray(cap_centroid, dtype=np.float64)
-    if refc.shape != (2,) or capc.shape != (2,):
-        raise ValueError("ref_centroid and cap_centroid must be length-2 tuples.")
-    shift = refc - capc
-    obs_shifted = obs + shift
-
-    # 2) nearest-neighbor match: reference -> shifted captured
-    tree = cKDTree(obs_shifted)
-    d, idx = tree.query(ref, k=1)
-
-    # 3) distance gate
-    keep = d <= max_dist if np.isfinite(max_dist) else np.ones_like(d, dtype=bool)
-    ref_m = ref[keep]
-    obs_m = obs_shifted[idx[keep]]
-
-    if len(ref_m) < min_matches:
-        raise RuntimeError(f"Insufficient matches after gating: {len(ref_m)} < {min_matches}")
-
-    # 4) Convert to normalized pupil coordinates
-    # Convert pixels → mm via lenslet pitch:
-    #   lenslet_pitch_mm = lenslet_pitch_px * pixel_pitch_mm
-    pixel_pitch_mm = pixel_pitch_um / 1000.0
-    lenslet_pitch_mm = lenslet_pitch_px * pixel_pitch_mm
-    scale = lenslet_pitch_mm  # mm per lenslet
-
-    radius = pupil_diameter_mm / 2.0
-
-    # Normalize pixel displacements to unit radius pupil
-    ref_norm = ((ref_m - refc) * (pixel_pitch_um / 1000)) / (pupil_diameter_mm / 2)
-    obs_norm = ((obs_m - refc) * (pixel_pitch_um / 1000)) / (pupil_diameter_mm / 2)
-
-
-    # 5) fit Z4–Z6 in normalized coordinates
-    z4, z5, z6 = fit_zernike_4_6_from_displacements(ref_norm, obs_norm)
-    print("Pupil radius (pixels):", radius/pixel_pitch_mm)
-    print("Mean displacement (pixels):", np.mean(np.linalg.norm(obs_m - ref_m, axis=1)))
-    print("Mean displacement (normalized):", np.mean(np.linalg.norm(obs_norm - ref_norm, axis=1)))
-    if return_pairs:
-        return (float(z4), float(z5), float(z6)), ref_m, obs_m
-    return (float(z4), float(z5), float(z6))
-
-#######################################
 
 def average_spot_spacing(spots, k=4):
     """
@@ -1176,18 +958,57 @@ def zernike_to_sph_cyl_axis(
     return float(S), float(C), float(axis_deg)
 
 
-def test_zernike_to_sph_cyl_axis(z4, z5, z6, k_defocus=1.0, k_astig=1.0):
-    M   = k_defocus * float(z4)
-    J0  = k_astig   * float(z6)
-    J45 = k_astig   * float(z5)
-
-    R = np.hypot(J0, J45)          # magnitude of astigmatism vector
-    C = -2.0 * R                   # cylinder (Thibos negative cyl)
-    axis_rad = 0.5 * np.arctan2(J45, J0)
-    axis_deg = np.degrees(axis_rad) % 180.0
-    S = M - 0.5 * C                # sphere = M - C/2
-
-    return float(S), float(C), float(axis_deg)
-
 reference_spots, reference_centroid = make_reference_spots(shape=(1200,1920),spacing=LENSLET_PITCH)
 
+
+def draw_spot_comparison(ref_spots, cap_spots, shape, 
+                         ref_color=(0,255,0), cap_color=(0,0,255),
+                         radius=2, thickness=-1,
+                         ref_centroid=None, cap_centroid=None):
+    """
+    Draw reference and captured spots on the same image.
+
+    Args:
+        ref_spots: array-like [(x, y), ...] for reference (will be drawn GREEN)
+        cap_spots: array-like [(x, y), ...] for captured (will be drawn RED)
+        shape: (H, W) shape of the output image
+        ref_color: BGR tuple for reference spots (default green)
+        cap_color: BGR tuple for captured spots (default red)
+        radius: circle radius for each spot
+        thickness: circle thickness (-1 = filled)
+        ref_centroid, cap_centroid: optional (cx, cy) to mark centers
+
+    Returns:
+        BGR image with both spot sets drawn.
+    """
+    # base blank or gray background
+    if len(shape) == 2:
+        img = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
+    else:
+        img = np.zeros(shape, dtype=np.uint8)
+    img[:] = (40, 40, 40)
+
+    ref_spots = np.asarray(ref_spots, dtype=np.float32)
+    cap_spots = np.asarray(cap_spots, dtype=np.float32)
+
+    # Draw reference spots (green)
+    for (x, y) in ref_spots:
+        if np.isfinite(x) and np.isfinite(y):
+            cv2.circle(img, (int(round(x)), int(round(y))), radius, ref_color, thickness)
+
+    # Draw captured spots (red)
+    for (x, y) in cap_spots:
+        if np.isfinite(x) and np.isfinite(y):
+            cv2.circle(img, (int(round(x)), int(round(y))), radius, cap_color, thickness)
+
+    # Optional centroid markers
+    if ref_centroid is not None:
+        cx, cy = ref_centroid
+        cv2.drawMarker(img, (int(round(cx)), int(round(cy))), (0,255,0),
+                       markerType=cv2.MARKER_CROSS, markerSize=10, thickness=1)
+    if cap_centroid is not None:
+        cx, cy = cap_centroid
+        cv2.drawMarker(img, (int(round(cx)), int(round(cy))), (0,0,255),
+                       markerType=cv2.MARKER_TILTED_CROSS, markerSize=10, thickness=1)
+
+    return img
