@@ -215,6 +215,9 @@ def image_spread(img: np.ndarray, centroid_x: float, centroid_y: float) -> float
 
 
 def shift_image_by_offset(image: np.ndarray, shift_x: float, shift_y: float) -> np.ndarray:
+    
+    shift_y = -1 * shift_y
+    
     """
     Shift the input image by (shift_x, shift_y) using subpixel-accurate affine transformation.
 
@@ -270,7 +273,7 @@ def quad_center(img: np.ndarray, max_iterations=10, ksize=3):
         max_iterations = 10
 
     while max_iterations:
-
+        #start = time.time()
         # Quadrants
         UL = img[0:frame_center_y, 0:frame_center_x]  # Upper Left
         UR = img[0:frame_center_y, frame_center_x:]   # Upper Right
@@ -302,7 +305,7 @@ def quad_center(img: np.ndarray, max_iterations=10, ksize=3):
         #print("v error: ",v_error)
 
         horizontal_shift = gain * image_width * h_error
-        vertical_shift   = -1 * gain * image_height * v_error  # Flip for correct direction
+        vertical_shift   = gain * image_height * v_error  # Flip for correct direction
 
         # Clip shifts
         cap = 0.2 * min(image_width, image_height)
@@ -326,6 +329,8 @@ def quad_center(img: np.ndarray, max_iterations=10, ksize=3):
         max_iterations -= 1
 
         if (np.sqrt(h_error ** 2 + v_error ** 2)) <= 0.01:
+            #elapsed = time.time() - start
+            #print(f"Elapsed time: {elapsed:.3f} seconds")
             break
 
     # Return the last computed shift center relative to original
